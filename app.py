@@ -353,8 +353,10 @@ if uploaded_video is not None:
                 st.caption("📌 값이 높을수록 흡연 확률이 높음 (50 이상 = 흡연 감지)")
     
     # 임시 파일 삭제
-    os.unlink(video_path)
-
+    try :
+        os.unlink(video_path)
+    except :
+        pass
 # 사이드바
 st.sidebar.markdown("## 📌 프로젝트 정보")
 st.sidebar.markdown("""
