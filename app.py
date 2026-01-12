@@ -6,6 +6,9 @@ from PIL import Image
 import os
 import cv2
 import tempfile
+import ollama  # LLM 연동을 위한 라이브러리 추가
+import base64
+from io import BytesIO
 
 # 페이지 설정
 st.set_page_config(
@@ -13,6 +16,41 @@ st.set_page_config(
     page_icon="🚭",
     layout="wide"
 )
+
+# --- [추가] LLM 리포트 생성 함수 ---
+def generate_llm_report(image, predicted_class, confidence):
+    """CNN 결과와 이미지를 바탕으로 Gemma3:4b 리포트를 생성합니다."""
+    try:
+        # 이미지를 base64로 인코딩하여 LLM에 전달
+        buffered = BytesIO()
+        image.save(buffered, format="JPEG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        
+        status = "흡연" if predicted_class == 'smoking' else "비흡연"
+        
+        prompt = f"""
+        당신은 금연 및 공공보건 전문가입니다.
+        비전 AI 분석 결과, 이 이미지는 {confidence:.1f}%의 확률로 [{status}] 상태로 판독되었습니다.
+        
+        사진의 배경과 정황을 분석하여 다음을 포함한 전문 리포트를 작성하세요:
+        1. 사진 속 정황 분석 (어디서 무엇을 하고 있는지)
+        2. 주변 인물(특히 어린이)에 대한 간접흡연 위험성
+        3. 금연을 위한 따뜻한 조언 또는 건강 유지 격려
+        
+        답변은 친절하게 한국어로 작성해주세요.
+        """
+        
+        response = ollama.chat(
+            model='gemma3:4b',
+            messages=[{
+                'role': 'user',
+                'content': prompt,
+                'images': [img_str]
+            }]
+        )
+        return response['message']['content']
+    except Exception as e:
+        return f"LLM 분석 중 오류가 발생했습니다. (Ollama 실행 여부를 확인하세요): {e}"
 
 # CSS 스타일
 st.markdown("""
@@ -42,6 +80,14 @@ st.markdown("""
     .no-smoking {
         background-color: #e8f5e9;
         border-left: 5px solid #4caf50;
+    }
+    .report-box {
+        background-color: #f0f2f6;
+        padding: 20px;
+        border-radius: 10px;
+        border: 1px solid #d1d5db;
+        color: #333;
+        line-height: 1.6;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -89,6 +135,8 @@ def preprocess_image(image):
     img = image.convert("RGB")
     img = img.resize((IMG_WIDTH, IMG_HEIGHT))
     img_array = np.array(img)
+    # 주피터 실습과 동일하게 스케일링이 필요하다면 아래 주석 해제
+    # img_array = img_array / 255.0 
     img_array = np.expand_dims(img_array, 0)
     return img_array
 
@@ -198,6 +246,13 @@ if uploaded_file is not None:
                 """, unsafe_allow_html=True)
                 st.success("✅ 흡연이 감지되지 않았습니다.")
 
+            # --- [추가] LLM 정밀 분석 리포트 섹션 ---
+            st.markdown("---")
+            st.markdown("### 🤖 AI 전문가 정밀 분석 (Gemma3)")
+            with st.spinner("✍️ 전문가 리포트를 생성 중입니다..."):
+                report = generate_llm_report(image, predicted_class, confidence)
+                st.markdown(f'<div class="report-box">{report}</div>', unsafe_allow_html=True)
+
 st.markdown("---")
 
 # ===================== 동영상 업로드 섹션 =====================
@@ -248,9 +303,6 @@ if uploaded_video is not None:
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            # 결과 표시 영역
-            result_container = st.container()
-            
             while cap.isOpened() and analyzed_count < max_frames:
                 ret, frame = cap.read()
                 if not ret:
@@ -269,7 +321,6 @@ if uploaded_video is not None:
                         'confidence': confidence
                     })
                     
-                    # 흡연 감지된 프레임 저장
                     if predicted_class == 'smoking' and confidence > 60:
                         smoking_frames.append({
                             'frame': frame_count,
@@ -301,13 +352,10 @@ if uploaded_video is not None:
             with col_r1:
                 st.metric("총 분석 프레임", f"{len(results)}개")
             with col_r2:
-                st.metric("흡연 감지 프레임", f"{smoking_count}개", 
-                         delta=f"{smoking_ratio:.1f}%")
+                st.metric("흡연 감지 프레임", f"{smoking_count}개", delta=f"{smoking_ratio:.1f}%")
             with col_r3:
                 st.metric("비흡연 프레임", f"{notsmoking_count}개")
             
-            # 최종 판정
-            st.markdown("---")
             if smoking_ratio > 30:
                 st.markdown("""
                 <div class="result-box smoking-detected">
@@ -327,71 +375,47 @@ if uploaded_video is not None:
                 """, unsafe_allow_html=True)
                 st.success("✅ 흡연이 감지되지 않았습니다.")
             
-            # 흡연 감지된 프레임 표시
             if smoking_frames:
                 st.markdown("---")
-                st.markdown("### 🚬 흡연 감지 프레임")
+                st.markdown("### 🚬 흡연 감지 프레임 및 전문가 소견")
                 
-                cols = st.columns(min(4, len(smoking_frames)))
-                for idx, sf in enumerate(smoking_frames[:8]):  # 최대 8개만 표시
-                    with cols[idx % 4]:
-                        st.image(sf['image'], caption=f"⏱️ {sf['time']:.1f}초 ({sf['confidence']:.1f}%)")
-            
-            # 타임라인 그래프
+                # 가장 신뢰도가 높은 프레임 하나를 뽑아 LLM 분석 수행
+                best_frame = max(smoking_frames, key=lambda x: x['confidence'])
+                best_image = Image.fromarray(best_frame['image'])
+                
+                col_v1, col_v2 = st.columns([1, 2])
+                with col_v1:
+                    st.image(best_frame['image'], caption=f"감지된 프레임 ({best_frame['confidence']:.1f}%)")
+                with col_v2:
+                    with st.spinner("🤖 LLM이 동영상 정황을 분석 중입니다..."):
+                        v_report = generate_llm_report(best_image, "smoking", best_frame['confidence'])
+                        st.markdown(f'<div class="report-box">{v_report}</div>', unsafe_allow_html=True)
+
             if results:
                 st.markdown("---")
                 st.markdown("### 📈 시간별 분석 결과")
-                
                 import pandas as pd
                 df = pd.DataFrame(results)
-                df['smoking_score'] = df.apply(
-                    lambda x: x['confidence'] if x['class'] == 'smoking' else 100 - x['confidence'], 
-                    axis=1
-                )
-                
+                df['smoking_score'] = df.apply(lambda x: x['confidence'] if x['class'] == 'smoking' else 100 - x['confidence'], axis=1)
                 st.line_chart(df.set_index('time')['smoking_score'])
-                st.caption("📌 값이 높을수록 흡연 확률이 높음 (50 이상 = 흡연 감지)")
     
-    # 임시 파일 삭제
-    try :
-        os.unlink(video_path)
-    except :
-        pass
-# 사이드바
+    try : os.unlink(video_path)
+    except : pass
+
+# 사이드바 및 푸터 (기존과 동일)
 st.sidebar.markdown("## 📌 프로젝트 정보")
 st.sidebar.markdown("""
 **AI기반 흡연자 감지 시스템**
-
-- **목적**: 어린이보호구역 및 금연구역 흡연 감지
-- **모델**: CNN (Convolutional Neural Network)
-- **분류 클래스**: smoking, notsmoking
-- **입력 이미지**: 224x224 RGB
+- **모델**: CNN + Gemma3:4b (LLM)
+- **목적**: 금연구역 모니터링 및 케어
 """)
-
-st.sidebar.markdown("---")
-
-st.sidebar.markdown("### 🔍 사용 방법")
-st.sidebar.markdown("""
-**이미지 분석**
-1. 이미지 업로드
-2. AI 분석 결과 확인
-
-**동영상 분석**
-1. 동영상 업로드
-2. 분석 옵션 설정
-3. '분석 시작' 버튼 클릭
-4. 프레임별 결과 확인
-""")
-
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🏢 프로젝트")
 st.sidebar.markdown("인공지능개발 양성과정 - 딥러닝 프로젝트")
 
-# 푸터
 st.markdown("---")
 st.markdown("""
 <div style="text-align: center; color: #888; padding: 1rem;">
     <p>🚭 AI기반 흡연자 감지 예측모델 개발 및 시각화</p>
-    <p>인공지능개발 양성과정 딥러닝 산출물</p>
 </div>
 """, unsafe_allow_html=True)
